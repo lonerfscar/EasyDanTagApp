@@ -1,3 +1,4 @@
+import webbrowser
 import requests
 import time
 import random
@@ -102,6 +103,7 @@ class DanbooruScraper:
         self.queue = queue.Queue()
         self.data_file = 'tag_data.json'
         self.tag_data = self.load_data()
+        self.build_spelling_index()  # 初始化时构建拼写索引
 
     def load_data(self):
         if os.path.exists(self.data_file):
@@ -115,6 +117,7 @@ class DanbooruScraper:
     def save_data(self):
         with open(self.data_file, 'w', encoding='utf-8') as f:
             json.dump(self.tag_data, f, ensure_ascii=False, indent=2)
+        self.build_spelling_index()  # 保存后更新索引
 
     def get_tag_info(self, tag):
         normalized_tag = tag.replace(' ', '_')
@@ -129,6 +132,24 @@ class DanbooruScraper:
 
         url = f"{self.base_url}/wiki_pages/{normalized_tag}"
         response = self.safe_request(url)
+
+        # 检测所有类型的错误（包括无响应）
+        if not response or response.status_code != 200:
+            # 总是生成建议链接，即使没有响应
+            suggestion_url = self.generate_suggestion_url(tag)
+
+            status_msg = f"无法获取标签信息: {tag}"
+            if response:
+                status_msg += f"\nHTTP状态码: {response.status_code}"
+            else:
+                status_msg += "\nHTTP状态码: 无响应"
+
+            self.queue.put({
+                'status': 'error',
+                'message': status_msg,
+                'suggestion_url': suggestion_url
+            })
+            return
 
         if not response or response.status_code != 200:
             self.queue.put({'status': 'info', 'message': '正在获取浏览器信息，请稍候...'})
@@ -148,6 +169,15 @@ class DanbooruScraper:
             return
 
         soup = BeautifulSoup(response.text, 'html.parser')
+
+        # 提取Posts数字
+        posts_element = soup.find('a', id='subnav-posts')
+        posts_count = 0
+        if posts_element:
+            match = re.search(r'Posts \((\d+)\)', posts_element.text)
+            if match:
+                posts_count = int(match.group(1))
+
         synonyms = [a.text.strip().replace(' ', '_') for a in soup.find_all('a', class_='wiki-other-name')]
 
         wiki_body = soup.find('div', id='wiki-page-body')
@@ -170,7 +200,8 @@ class DanbooruScraper:
             'synonyms': ", ".join(synonyms),
             'meaning': meaning.strip(),
             'meaning_translation': "",
-            'sections': content
+            'sections': content,
+            'posts': posts_count  # 新增字段
         }
 
         self.tag_data[tag_key] = tag_info
@@ -181,66 +212,166 @@ class DanbooruScraper:
             'result': tag_info
         })
 
+    def generate_suggestion_url(self, tag):
+        """生成可能的正确标签建议URL"""
+        # 首先尝试基于规则的修正
+        suggestions = self.generate_rule_based_suggestions(tag)
+
+        # 尝试拼写修正
+        spelling_suggestion = self.find_closest_match(tag)
+        if spelling_suggestion:
+            suggestions.append(spelling_suggestion)
+
+        # 生成建议链接
+        for suggestion in suggestions:
+            normalized = suggestion.replace(' ', '_')
+
+            # 检查本地缓存
+            if normalized in self.tag_data:
+                return f"{self.base_url}/wiki_pages/{normalized}"
+
+            # 检查拼写修正是否在索引中
+            if suggestion in self.spelling_index:
+                return f"{self.base_url}/wiki_pages/{normalized}"
+
+        # 如果没有找到，返回最可能的建议
+        if suggestions:
+            normalized = suggestions[0].replace(' ', '_')
+            return f"{self.base_url}/wiki_pages/{normalized}"
+
+        # 默认返回基础URL
+        return f"{self.base_url}/wiki_pages/"
+
+    def generate_rule_based_suggestions(self, tag):
+        """生成基于规则的拼写建议"""
+        suggestions = []
+
+        # 常见复数形式
+        if tag.endswith('s'):
+            suggestions.append(tag[:-1])
+        elif tag.endswith('es'):
+            suggestions.append(tag[:-2])
+        else:
+            suggestions.append(tag + 's')
+            suggestions.append(tag + 'es')
+
+        # 常见拼写错误修正
+        common_corrections = {
+            'girl': 'girls',
+            'boy': 'boys',
+            'hair': 'hairs',
+            'eye': 'eyes',
+            'dress': 'dresses',
+            'glass': 'glasses',
+            'animal': 'animals',
+            'ear': 'ears',
+            'hand': 'hands',
+            'foot': 'feet',
+            'tooth': 'teeth',
+            'man': 'men',
+            'woman': 'women',
+            'child': 'children'
+        }
+
+        # 尝试修正常见错误
+        for wrong, correct in common_corrections.items():
+            if tag.endswith(wrong):
+                suggestions.append(tag[:-len(wrong)] + correct)
+
+        return list(set(suggestions))  # 去重
+
     def convert_html_to_text(self, html_content):
-        # 直接处理HTML字符串，不使用BeautifulSoup
-        result = ""
-        indent_level = 0
-        in_list = False
-        in_list_item = False
+        """将HTML内容转换为格式化的纯文本，正确处理嵌套列表"""
+        if not html_content:
+            return ""
 
-        # 移除所有HTML注释
-        html_content = re.sub(r'<!--.*?-->', '', html_content, flags=re.DOTALL)
+        soup = BeautifulSoup(html_content, 'html.parser')
+        # 移除所有不需要的标签
+        for tag in soup(['script', 'style', 'noscript']):
+            tag.decompose()
 
-        # 处理特殊结构
-        html_content = re.sub(r'</?(div|span)[^>]*>', '', html_content)
+        # 处理根节点
+        return self.process_node(soup, level=0).strip()
 
-        # 分割HTML标签
-        tokens = re.split(r'(<[^>]+>)', html_content)
+    def process_node(self, node, level=0):
+        """递归处理节点及其子节点"""
+        if isinstance(node, str):
+            # 处理文本节点 - 保留原始空白
+            return node
 
-        for token in tokens:
-            if token.startswith('<h6>') or token.startswith('<h5>') or token.startswith('<h4>'):
-                # 标题
-                text = re.sub(r'<[^>]+>', '', token).strip()
-                result += f"{text}\n\n"
-            elif token.startswith('<ul>') or token.startswith('<ol>'):
-                # 列表开始
-                in_list = True
-                indent_level += 1
-            elif token.startswith('</ul>') or token.startswith('</ol>'):
-                # 列表结束
-                in_list = False
-                indent_level -= 1
-                if indent_level == 0:
-                    result += "\n"
-            elif token.startswith('<li>'):
-                # 列表项开始
-                in_list_item = True
-                indent = "    " * (indent_level - 1)
-                result += f"{indent}• "
-            elif token.startswith('</li>'):
-                # 列表项结束
-                in_list_item = False
-                result += "\n"
-            elif token.startswith('<a '):
-                # 链接
-                match = re.search(r'>(.*?)</a>', token)
-                if match:
-                    link_text = match.group(1).strip()
-                    result += f"{link_text} "
-            elif not token.startswith('<'):
-                # 纯文本
-                text = token.strip()
-                if text:
-                    if in_list_item:
-                        result += f"{text} "
-                    else:
-                        result += f"{text}\n"
+        if node.name == 'a':
+            # 处理超链接 - 只提取文本
+            return self.process_link(node)
 
-        # 清理多余的空格和换行
-        result = re.sub(r'\n\s*\n', '\n\n', result)
-        result = re.sub(r' +', ' ', result)
+        # 处理列表容器
+        if node.name in ['ul', 'ol']:
+            return self.process_list_container(node, level)
 
-        return result.strip()
+        # 处理列表项
+        if node.name == 'li':
+            return self.process_list_item(node, level)
+
+        # 处理特殊标签
+        if node.name in ['h4', 'h5', 'h6']:
+            return f"\n\n{self.get_node_text(node)}\n\n"
+
+        if node.name in ['p', 'div']:
+            return f"\n\n{self.get_node_text(node)}\n\n"
+
+        if node.name == 'br':
+            return "\n"
+
+        # 默认处理：递归处理所有子节点
+        return self.get_node_text(node)
+
+    def process_list_container(self, node, level):
+        """处理列表容器（ul/ol）"""
+        items = []
+        for child in node.children:
+            # 只处理直接子节点
+            if child.name in ['li', 'ul', 'ol']:
+                processed = self.process_node(child, level)
+                if processed:
+                    items.append(processed)
+
+        # 合并列表项
+        return "\n".join(items)
+
+    def process_list_item(self, node, level):
+        """处理列表项，支持嵌套"""
+        contents = []
+        for child in node.children:
+            # 递归处理子节点
+            processed = self.process_node(child, level + 1)
+            if processed:
+                contents.append(processed)
+
+        # 拼接内容并添加缩进
+        indent = "  " * level
+        content = " ".join(contents).strip()
+        return f"{indent}{content}" if content else ""
+
+    def get_node_text(self, node):
+        """获取节点的文本内容"""
+        parts = []
+        for child in node.children:
+            processed = self.process_node(child)
+            if processed:
+                parts.append(processed)
+
+        # 合并相邻文本
+        return " ".join(parts)
+
+    def process_link(self, node):
+        """处理超链接元素，返回纯文本"""
+        # 直接提取链接文本
+        text = node.get_text(strip=False)
+
+        # 如果链接包含图片，返回空
+        if node.find('img'):
+            return ""
+
+        return text
 
     def process_wiki_content(self, wiki_body):
         sections = {}
@@ -325,6 +456,85 @@ class DanbooruScraper:
         pattern = r'^[a-zA-Z0-9_\-\.:]+$'
         return bool(re.match(pattern, tag))
 
+    def build_spelling_index(self):
+        """构建拼写建议索引"""
+        self.spelling_index = set()
+
+        for tag_data in self.tag_data.values():
+            # 添加标签本身
+            self.spelling_index.add(tag_data['tag'].lower())
+
+            # 添加同义词
+            if tag_data.get('synonyms'):
+                for syn in tag_data['synonyms'].split(','):
+                    self.spelling_index.add(syn.strip().lower())
+
+            # 添加释义中的关键词
+            if tag_data.get('meaning'):
+                words = re.findall(r'\b\w+\b', tag_data['meaning'].lower())
+                self.spelling_index.update(words)
+
+            # 添加章节内容中的关键词
+            if tag_data.get('sections'):
+                for section in tag_data['sections'].values():
+                    words = re.findall(r'\b\w+\b', section.lower())
+                    self.spelling_index.update(words)
+
+        # 过滤掉过短的词汇
+        self.spelling_index = {word for word in self.spelling_index if len(word) > 3}
+
+    def find_closest_match(self, word):
+        """使用编辑距离找到最接近的匹配"""
+        if not hasattr(self, 'spelling_index') or not self.spelling_index:
+            self.build_spelling_index()
+
+        word = word.lower()
+
+        # 如果是已知标签，直接返回
+        if word in self.spelling_index:
+            return word
+
+        # 计算编辑距离
+        min_distance = float('inf')
+        best_match = None
+
+        for candidate in self.spelling_index:
+            # 跳过完全包含的情况（如"girl"和"girls"）
+            if word in candidate or candidate in word:
+                continue
+
+            # 计算编辑距离
+            distance = self.levenshtein_distance(word, candidate)
+            if distance < min_distance:
+                min_distance = distance
+                best_match = candidate
+
+        # 如果编辑距离在可接受范围内
+        if best_match and min_distance <= min(3, len(word) // 2):
+            return best_match
+
+        return None
+
+    def levenshtein_distance(self, s1, s2):
+        """计算两个字符串的编辑距离"""
+        if len(s1) < len(s2):
+            return self.levenshtein_distance(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+
+        return previous_row[-1]
+
 
 class SectionFrame(ttk.Frame):
     def __init__(self, master, title, content, **kwargs):
@@ -359,6 +569,8 @@ class EasyDanTagApp:
         self.search_timer_id = None
         self.create_widgets()
         self.master.after(100, self.check_queue)
+
+
 
     def create_widgets(self):
         config_frame = ttk.Frame(self.master, padding="10")
@@ -419,14 +631,26 @@ class EasyDanTagApp:
 
         tag_frame = ttk.LabelFrame(self.fixed_frame, text="标签", padding=5)
         tag_frame.pack(fill=tk.X, padx=5, pady=5)
+        # 修改为水平布局
+        inner_frame = ttk.Frame(tag_frame)
+        inner_frame.pack(fill=tk.X)
+
         self.tag_label = ttk.Label(
-            tag_frame,
+            inner_frame,
             text="",
             font=('TkDefaultFont', 10),
             cursor="hand2"
         )
-        self.tag_label.pack(anchor='w', padx=5, pady=2, fill=tk.X)
-        self.tag_label.bind("<Button-1>", self.copy_tag_to_clipboard)
+        self.tag_label.pack(side=tk.LEFT, padx=5, pady=2)
+
+        # 新增Posts标签
+        self.posts_label = ttk.Label(
+            inner_frame,
+            text="",
+            font=('TkDefaultFont', 9),
+            foreground="grey"
+        )
+        self.posts_label.pack(side=tk.RIGHT, padx=5)
 
         tag_trans_frame = ttk.LabelFrame(self.fixed_frame, text="标签翻译", padding=5)
         tag_trans_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -581,13 +805,127 @@ class EasyDanTagApp:
             self.status_var.set(result['message'])
         else:
             self.status_var.set(result['message'])
-            messagebox.showerror("错误", result['message'])
+
+            # 处理带建议链接的错误
+            if 'suggestion_url' in result:
+                self.show_suggestion_dialog(result['message'], result['suggestion_url'])
+            else:
+                messagebox.showerror("错误", result['message'])
+
+    def show_suggestion_dialog(self, message, url):
+        """显示建议链接的弹窗 - 优化布局"""
+        dialog = tk.Toplevel(self.master)
+        dialog.title("标签未找到")
+        dialog.geometry("450x230")  # 增加高度确保内容完整显示
+        dialog.resizable(False, False)
+        dialog.transient(self.master)
+        dialog.grab_set()
+
+        # 主内容框架
+        content_frame = ttk.Frame(dialog, padding=15)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 错误消息标签
+        msg_label = ttk.Label(
+            content_frame,
+            text=message,
+            wraplength=400,  # 增加换行宽度
+            justify="center",
+            font=('TkDefaultFont', 10)
+        )
+        msg_label.pack(pady=(0, 15))
+
+        # 分隔线
+        ttk.Separator(content_frame).pack(fill=tk.X, pady=5)
+
+        # 建议标签框架
+        suggestion_frame = ttk.Frame(content_frame)
+        suggestion_frame.pack(fill=tk.X, pady=10)
+
+        # 建议标签标题
+        suggestion_title = ttk.Label(
+            suggestion_frame,
+            text="可能正确的标签:",
+            font=('TkDefaultFont', 10, 'bold')
+        )
+        suggestion_title.pack(anchor='w', padx=5)
+
+        # 可点击的链接
+        tag_name = url.split('/')[-1].replace('_', ' ')
+        link_label = ttk.Label(
+            suggestion_frame,
+            text=tag_name,
+            foreground="blue",
+            cursor="hand2",
+            font=('TkDefaultFont', 10, 'underline'),
+            padding=(5, 2)
+        )
+        link_label.pack(anchor='w', padx=15, pady=(5, 0))
+        link_label.bind("<Button-1>", lambda e, u=url: self.open_url(u))
+
+        # 完整的URL显示（可选）
+        url_label = ttk.Label(
+            suggestion_frame,
+            text=url,
+            font=('TkDefaultFont', 8),
+            foreground="grey",
+            wraplength=400
+        )
+        url_label.pack(anchor='w', padx=15, pady=(2, 0))
+
+        # 操作按钮框架
+        button_frame = ttk.Frame(content_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # 确定按钮
+        ok_button = ttk.Button(
+            button_frame,
+            text="确定",
+            width=10,
+            command=dialog.destroy
+        )
+        ok_button.pack(side=tk.RIGHT, padx=5)
+
+        # 搜索按钮
+        search_button = ttk.Button(
+            button_frame,
+            text="搜索建议标签",
+            width=15,
+            command=lambda t=tag_name: self.fill_and_search(t, dialog)
+        )
+        search_button.pack(side=tk.RIGHT, padx=5)
+
+    def fill_and_search(self, tag, dialog=None):
+        """将标签填入搜索框并触发搜索"""
+        # 关闭弹窗（如果存在）
+        if dialog:
+            dialog.destroy()
+
+        # 填入搜索框
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.insert(0, tag)
+
+        # 触发搜索
+        self.search_tag()
+
+        # 设置状态提示
+        self.status_var.set(f"正在搜索建议标签: {tag}")
+
+    def open_url(self, url):
+        """打开浏览器访问URL"""
+        webbrowser.open(url)
+        self.master.focus_set()
 
     def display_tag_info(self, tag_info):
         for widget in self.dynamic_frame.winfo_children():
             widget.destroy()
 
         self.tag_label.config(text=tag_info['tag'])
+
+        # 显示Posts数字
+        posts = tag_info.get('posts', 0)
+        self.posts_label.config(text=f"Posts: {posts:,}" if posts > 0 else "")
+
         self.tag_translation_entry.delete(0, tk.END)
         self.tag_translation_entry.insert(0, tag_info.get('tag_translation', ''))
 
